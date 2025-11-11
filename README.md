@@ -1,3 +1,7 @@
+**Modification**: IP mappings are now persistent with no 60-second timeout. Eviction occurs only when the IP pool is full, using LRU order.
+
+---
+
 [![tun2proxy](https://socialify.git.ci/tun2proxy/tun2proxy/image?description=1&language=1&name=1&stargazers=1&theme=Light)](https://github.com/tun2proxy/tun2proxy)
 
 # tun2proxy

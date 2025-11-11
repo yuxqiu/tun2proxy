@@ -4,16 +4,8 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    time::{Duration, Instant},
 };
 use tproxy_config::IpCidr;
-
-const MAPPING_TIMEOUT: u64 = 60; // Mapping timeout in seconds
-
-struct NameCacheEntry {
-    name: String,
-    expiry: Instant,
-}
 
 /// A virtual DNS server which allocates IP addresses to clients.
 /// The IP addresses are in the range of private IP addresses.
@@ -27,15 +19,34 @@ pub struct VirtualDns {
     next_addr: IpAddr,
 }
 
+struct NameCacheEntry {
+    name: String,
+}
+
 impl VirtualDns {
     pub fn new(ip_pool: IpCidr) -> Self {
+        let network_addr = ip_pool.first_address();
+        let broadcast_addr = ip_pool.last_address();
+        let capacity = match (network_addr, broadcast_addr) {
+            (IpAddr::V4(n), IpAddr::V4(b)) => {
+                let n: u32 = n.into();
+                let b: u32 = b.into();
+                (b - n + 1) as usize
+            }
+            (IpAddr::V6(n), IpAddr::V6(b)) => {
+                let n: u128 = n.into();
+                let b: u128 = b.into();
+                (b - n + 1) as usize
+            }
+            _ => unreachable!(),
+        };
         Self {
             trailing_dot: false,
-            next_addr: ip_pool.first_address(),
+            next_addr: network_addr,
             name_to_ip: HashMap::default(),
-            network_addr: ip_pool.first_address(),
-            broadcast_addr: ip_pool.last_address(),
-            lru_cache: LruCache::new_unbounded(),
+            lru_cache: LruCache::new(capacity),
+            network_addr,
+            broadcast_addr,
         }
     }
 
@@ -50,11 +61,10 @@ impl VirtualDns {
     }
 
     fn increment_ip(addr: IpAddr) -> Result<IpAddr> {
-        let mut ip_bytes = match addr as IpAddr {
+        let mut ip_bytes = match addr {
             IpAddr::V4(ip) => Vec::<u8>::from(ip.octets()),
             IpAddr::V6(ip) => Vec::<u8>::from(ip.octets()),
         };
-
         // Traverse bytes from right to left and stop when we can add one.
         for j in 0..ip_bytes.len() {
             let i = ip_bytes.len() - 1 - j;
@@ -81,9 +91,7 @@ impl VirtualDns {
     // which connects the tun interface to the client, so existing IP address to name
     // mappings to not expire as long as the connection is active.
     pub fn touch_ip(&mut self, addr: &IpAddr) {
-        _ = self.lru_cache.get_mut(addr).map(|entry| {
-            entry.expiry = Instant::now() + Duration::from_secs(MAPPING_TIMEOUT);
-        });
+        let _ = self.lru_cache.get(addr);
     }
 
     pub fn resolve_ip(&mut self, addr: &IpAddr) -> Option<&String> {
@@ -99,51 +107,61 @@ impl VirtualDns {
             name
         };
 
-        let now = Instant::now();
-
-        // Iterate through all entries of the LRU cache and remove those that have expired.
-        loop {
-            let (ip, entry) = match self.lru_cache.iter().next() {
-                None => break,
-                Some((ip, entry)) => (ip, entry),
-            };
-
-            // The entry has expired.
-            if now > entry.expiry {
-                let name = entry.name.clone();
-                self.lru_cache.remove(&ip.clone());
-                self.name_to_ip.remove(&name);
-                continue; // There might be another expired entry after this one.
-            }
-
-            break; // The entry has not expired and all following entries are newer.
-        }
-
-        // Return the IP if it is stored inside our LRU cache.
-        if let Some(ip) = self.name_to_ip.get(&insert_name) {
-            let ip = *ip;
-            self.touch_ip(&ip);
+        // Return the IP if it is stored inside our name_to_ip map.
+        if let Some(&ip) = self.name_to_ip.get(&insert_name) {
+            self.lru_cache.get(&ip);
             return Ok(ip);
         }
 
-        // Otherwise, store name and IP pair inside the LRU cache.
-        let started_at = self.next_addr;
+        // Check if we are at capacity.
+        if self.lru_cache.len() == self.lru_cache.capacity() {
+            // Full, evict the LRU entry.
+            if let Some((old_ip, old_entry)) = self.lru_cache.remove_lru() {
+                self.name_to_ip.remove(&old_entry.name);
+                let name_clone = insert_name.clone();
+                self.lru_cache.insert(old_ip, NameCacheEntry { name: insert_name });
+                self.name_to_ip.insert(name_clone, old_ip);
+                self.next_addr = Self::increment_ip(old_ip)?;
+                if self.next_addr > self.broadcast_addr || self.next_addr < self.network_addr {
+                    self.next_addr = self.network_addr;
+                }
+                return Ok(old_ip);
+            }
+        }
 
+        // Otherwise, find a vacant IP in the pool.
+        let started_at = self.next_addr;
         loop {
             if let RawEntryMut::Vacant(vacant) = self.lru_cache.raw_entry_mut().from_key(&self.next_addr) {
-                let expiry = Instant::now() + Duration::from_secs(MAPPING_TIMEOUT);
-                let name0 = insert_name.clone();
-                vacant.insert(self.next_addr, NameCacheEntry { name: insert_name, expiry });
-                self.name_to_ip.insert(name0, self.next_addr);
-                return Ok(self.next_addr);
+                let name_clone = insert_name.clone();
+                vacant.insert(self.next_addr, NameCacheEntry { name: insert_name });
+                self.name_to_ip.insert(name_clone, self.next_addr);
+                let allocated = self.next_addr;
+                self.next_addr = Self::increment_ip(self.next_addr)?;
+                if self.next_addr > self.broadcast_addr || self.next_addr < self.network_addr {
+                    self.next_addr = self.network_addr;
+                }
+                return Ok(allocated);
             }
             self.next_addr = Self::increment_ip(self.next_addr)?;
-            if self.next_addr == self.broadcast_addr {
-                // Wrap around.
+            if self.next_addr > self.broadcast_addr || self.next_addr < self.network_addr {
                 self.next_addr = self.network_addr;
             }
             if self.next_addr == started_at {
-                return Err("Virtual IP space for DNS exhausted".into());
+                // If we've looped back, treat as full and evict LRU.
+                if let Some((old_ip, old_entry)) = self.lru_cache.remove_lru() {
+                    self.name_to_ip.remove(&old_entry.name);
+                    let name_clone = insert_name.clone();
+                    self.lru_cache.insert(old_ip, NameCacheEntry { name: insert_name });
+                    self.name_to_ip.insert(name_clone, old_ip);
+                    self.next_addr = Self::increment_ip(old_ip)?;
+                    if self.next_addr > self.broadcast_addr || self.next_addr < self.network_addr {
+                        self.next_addr = self.network_addr;
+                    }
+                    return Ok(old_ip);
+                } else {
+                    return Err("Virtual IP space for DNS exhausted".into());
+                }
             }
         }
     }
